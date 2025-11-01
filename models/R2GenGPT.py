@@ -1,7 +1,9 @@
 import os
 import json
 import torch
+import torch.serialization
 import torch.nn as nn
+from torch.ao.quantization import prepare_qat, get_default_qat_qconfig
 import pytorch_lightning as pl
 from transformers import LlamaForCausalLM, LlamaTokenizer, BitsAndBytesConfig
 from evalcap.bleu.bleu import Bleu
@@ -84,6 +86,32 @@ class R2GenGPT(pl.LightningModule):
             self.llama_model = get_peft_model(self.llama_model, peft_config)
             self.llama_model.print_trainable_parameters()
             print("Loading 4-bit QLoRA LLAMA Done ✅")
+            
+        # ============================================================
+        # 🔹 Case 2: Fake QAT + Freeze
+        # ============================================================
+            
+        elif args.fake_qat:
+            print("→ QAT-Fake mode detected: LLaMA frozen, fake quant active")
+
+            self.llama_model = LlamaForCausalLM.from_pretrained(
+                args.llama_model,
+                torch_dtype=torch.float16,
+                device_map=None,
+                low_cpu_mem_usage=True
+            )
+
+            # Freeze semua parameter (LLM tidak dilatih)
+            for name, param in self.llama_model.named_parameters():
+                param.requires_grad = False
+
+            # Siapkan konfigurasi quantization aware training (fake quantization)
+            qat_qconfig = get_default_qat_qconfig("fbgemm")
+            self.llama_model.qconfig = qat_qconfig
+            prepare_qat(self.llama_model, inplace=True)
+
+            self.embed_tokens = self.llama_model.get_input_embeddings()
+            print("✅ Fake QAT prepared (simulated 8-bit quantization, FP16 compute)")
 
         # ============================================================
         # 🔹 Case 2: Full mode → FP16 (no quantization, no LoRA)
@@ -113,9 +141,25 @@ class R2GenGPT(pl.LightningModule):
         self.val_score = 0.0
 
         if args.delta_file is not None:
-            state_dict = torch.load(args.delta_file, map_location=torch.device(f'cuda:{torch.cuda.current_device()}'))['model']
-            self.load_state_dict(state_dict=state_dict, strict=False)
-            print(f'Load checkpoint from {args.delta_file}')
+            # ✅ Kompatibel dengan semua versi Lightning (lama & baru)
+            try:
+                from lightning_fabric.utilities.data import AttributeDict  # Lightning >= 2.0
+            except ImportError:
+                from pytorch_lightning.utilities.data import AttributeDict  # Lightning < 2.0
+
+            # Izinkan AttributeDict supaya tidak error saat load
+            torch.serialization.add_safe_globals([AttributeDict])
+
+            # ✅ Load checkpoint (PyTorch >= 2.6 perlu weights_only=False)
+            state = torch.load(args.delta_file, map_location='cuda', weights_only=False)
+
+            # Ambil state_dict model (fleksibel)
+            state_dict = state.get('model', state)
+
+            # Load ke model
+            self.load_state_dict(state_dict, strict=False)
+            print(f'✅ Loaded checkpoint from {args.delta_file}')
+
 
 
     def score(self, ref, hypo):
@@ -321,7 +365,7 @@ class R2GenGPT(pl.LightningModule):
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
         json.dump(hypo, open(os.path.join(result_folder, f"result_{current_epoch}_{global_step}" + '.json'), 'w'))
         json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
-        self.print(eval_res)
+        print(eval_res)
 
         val_score = 0
         for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):
