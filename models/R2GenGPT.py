@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import torch.serialization
+from lightning_fabric.utilities.data import AttributeDict
 import torch.nn as nn
 from torch.ao.quantization import prepare_qat, get_default_qat_qconfig
 import pytorch_lightning as pl
@@ -13,8 +14,8 @@ from evalcap.meteor.meteor import Meteor
 from transformers import SwinModel
 from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
-from peft import LoraConfig, get_peft_model
 import pdb
+import sys, time
 
 class R2GenGPT(pl.LightningModule):
     """
@@ -42,9 +43,15 @@ class R2GenGPT(pl.LightningModule):
         elif args.freeze_vm:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
+            trainable_params = sum(p.numel() for p in self.visual_encoder.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.visual_encoder.parameters())
+            print(f"[Vision Encoder] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
             print(f'Loading Frozen vision encoder:{args.vision_model} -- Done')
         else:
-            print(f'Loading Trainable vision encoder:{args.vision_model} -- Done')
+            trainable_params = sum(p.numel() for p in self.visual_encoder.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.visual_encoder.parameters())
+            print(f"[Vision Encoder] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
+            print(f'Loading Full Trainable vision encoder:{args.vision_model} -- Done')
         print('Loading LLAMA model...')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
         self.llama_tokenizer.pad_token_id = 0
@@ -81,40 +88,45 @@ class R2GenGPT(pl.LightningModule):
                 lora_alpha=args.llm_alpha,
                 lora_dropout=args.lora_dropout,
                 bias="none",
-                target_modules=["q_proj", "v_proj"]  # standar untuk LLAMA
+                # target_modules=["q_proj", "v_proj"]
             )
             self.llama_model = get_peft_model(self.llama_model, peft_config)
             self.llama_model.print_trainable_parameters()
             print("Loading 4-bit QLoRA LLAMA Done ✅")
             
         # ============================================================
-        # 🔹 Case 2: Fake QAT + Freeze
+        # 🔹 Case 2: Fake QAT + Freeze (lm_head only)
         # ============================================================
-            
         elif args.fake_qat:
-            print("→ QAT-Fake mode detected: LLaMA frozen, fake quant active")
+            print("→ Fake QAT Simulasi INT8 aktif (lm_head only, clean mode)")
 
+            # 1️⃣ Load model di FP16
             self.llama_model = LlamaForCausalLM.from_pretrained(
                 args.llama_model,
                 torch_dtype=torch.float16,
                 device_map=None,
-                low_cpu_mem_usage=True
             )
+            self.llama_model.eval()  # stabilisasi LayerNorm dan Dropout
 
-            # Freeze semua parameter (LLM tidak dilatih)
+            # 2️⃣ Freeze semua parameter (hemat & aman)
             for name, param in self.llama_model.named_parameters():
                 param.requires_grad = False
 
-            # Siapkan konfigurasi quantization aware training (fake quantization)
-            qat_qconfig = get_default_qat_qconfig("fbgemm")
-            self.llama_model.qconfig = qat_qconfig
-            prepare_qat(self.llama_model, inplace=True)
+            # 3️⃣ Fake quantisasi simulasi pada lm_head
+            w = self.llama_model.lm_head.weight.data
+            qmin, qmax = -128, 127
+            scale = w.abs().max() / max(qmax, 1)
+            w_q = torch.clamp((w / scale).round(), qmin, qmax) * scale
+            self.llama_model.lm_head.weight.data.copy_(w_q)
+            print("✅ Fake QAT simulated on lm_head weights (INT8 emulation, no observer)")
 
+            # 4️⃣ Ambil embedding
             self.embed_tokens = self.llama_model.get_input_embeddings()
-            print("✅ Fake QAT prepared (simulated 8-bit quantization, FP16 compute)")
+            print("✅ LLaMA frozen, Fake QAT ready (FP16 compute, INT8-like behavior)")
 
+        
         # ============================================================
-        # 🔹 Case 2: Full mode → FP16 (no quantization, no LoRA)
+        # 🔹 Case 3: Full mode → FP16 (no quantization, no LoRA)
         # ============================================================
         else:
             print("→ Full precision mode detected: loading FP16 model")
@@ -127,6 +139,10 @@ class R2GenGPT(pl.LightningModule):
             self.embed_tokens = self.llama_model.get_input_embeddings()
             for name, param in self.llama_model.named_parameters():
                 param.requires_grad = False
+                
+            trainable_params = sum(p.numel() for p in self.llama_model.parameters() if p.requires_grad)
+            total_params = sum(p.numel() for p in self.llama_model.parameters())
+            print(f"[LLM] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
             print("Loading FP16 LLAMA Done ✅")
 
         # ============================================================
@@ -141,12 +157,6 @@ class R2GenGPT(pl.LightningModule):
         self.val_score = 0.0
 
         if args.delta_file is not None:
-            # ✅ Kompatibel dengan semua versi Lightning (lama & baru)
-            try:
-                from lightning_fabric.utilities.data import AttributeDict  # Lightning >= 2.0
-            except ImportError:
-                from pytorch_lightning.utilities.data import AttributeDict  # Lightning < 2.0
-
             # Izinkan AttributeDict supaya tidak error saat load
             torch.serialization.add_safe_globals([AttributeDict])
 
@@ -285,16 +295,13 @@ class R2GenGPT(pl.LightningModule):
             "epoch": current_epoch,
             "step":global_step
         }
-        # 🔹 Buat folder checkpoints
-        ckpt_dir = os.path.abspath(os.path.join(self.hparams.savedmodel_path, "weights"))
-        os.makedirs(ckpt_dir, exist_ok=True)
-
-        filename = f"checkpoint_epoch{current_epoch}_step{global_step}_bleu{eval_res['Bleu_4']:.3f}_cider{eval_res['CIDEr']:.3f}.pth"
-        save_to = os.path.join(ckpt_dir, filename)
-
-        # 🔹 Simpan checkpoint
+        os.makedirs(os.path.join(self.hparams.savedmodel_path, 'weights'), exist_ok=True)
+        save_to = os.path.join(
+            self.hparams.savedmodel_path, 'weights',
+            "checkpoint_epoch{}_step{}_bleu{:3f}_cider{:3f}.pth".format(current_epoch, global_step, eval_res['Bleu_4'], eval_res['CIDEr']),
+        )
+        self.print("Saving checkpoint at step {} to {}.".format(global_step, save_to))
         torch.save(save_obj, save_to)
-        print(f"Checkpoint saved at step {global_step} → {save_to}")
         
     
     def validation_step(self, samples, batch_idx):
@@ -359,13 +366,14 @@ class R2GenGPT(pl.LightningModule):
         hypo = {k:[v] for k, v in zip(ids, hypo)}
         eval_res = self.score(ref=ref,hypo=hypo)
         self.log_dict(eval_res, sync_dist=True, logger=True)
+        self.trainer.strategy.barrier()
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
         json.dump(hypo, open(os.path.join(result_folder, f"result_{current_epoch}_{global_step}" + '.json'), 'w'))
         json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
-        print(eval_res)
+        self.print(eval_res, sync_dist=True)
 
         val_score = 0
         for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):

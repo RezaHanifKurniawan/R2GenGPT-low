@@ -11,7 +11,7 @@ def add_callbacks(args):
 
     # --------- Add Callbacks
     checkpoint_callback = ModelCheckpoint(
-        dirpath=os.path.join(log_dir, "checkpoints"),
+        dirpath=os.path.join(log_dir, "weights"),
         filename="{epoch}-{step}",
         save_top_k=-1,
         every_n_train_steps=args.every_n_train_steps,
