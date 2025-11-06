@@ -365,21 +365,29 @@ class R2GenGPT(pl.LightningModule):
         ref = {k:[v] for k, v in zip(ids, ref)}
         hypo = {k:[v] for k, v in zip(ids, hypo)}
         eval_res = self.score(ref=ref,hypo=hypo)
+        # ====================================================
+        # 🔹 Sinkronisasi antar GPU (agar eval_res global)
+        # ====================================================
+        if torch.distributed.is_initialized():
+            for k, v in eval_res.items():
+                t = torch.tensor(v, dtype=torch.float32, device=self.device)
+                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
+                eval_res[k] = t.item()
         self.log_dict(eval_res, sync_dist=True, logger=True)
-        self.trainer.strategy.barrier()
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
         json.dump(hypo, open(os.path.join(result_folder, f"result_{current_epoch}_{global_step}" + '.json'), 'w'))
         json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
-        self.print(eval_res, sync_dist=True)
 
         val_score = 0
         for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):
             val_score += eval_res[score_type] * weight
 
-        if self.trainer.local_rank == 0:
+        if self.trainer.global_rank == 0:
+            self.print(f"[Sync across {torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1} GPUs] "
+                   f"{ {**eval_res, 'val_score': val_score} }")
             if val_score > self.val_score:
                 self.save_checkpoint(eval_res)
                 self.val_score = val_score
