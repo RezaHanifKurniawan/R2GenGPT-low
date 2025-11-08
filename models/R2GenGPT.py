@@ -4,7 +4,6 @@ import torch
 import torch.serialization
 from lightning_fabric.utilities.data import AttributeDict
 import torch.nn as nn
-from torch.ao.quantization import prepare_qat, get_default_qat_qconfig
 import pytorch_lightning as pl
 from transformers import LlamaForCausalLM, LlamaTokenizer, BitsAndBytesConfig
 from evalcap.bleu.bleu import Bleu
@@ -14,8 +13,8 @@ from evalcap.meteor.meteor import Meteor
 from transformers import SwinModel
 from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
-import pdb
-import sys, time
+import pynvml, psutil
+pynvml.nvmlInit()
 
 class R2GenGPT(pl.LightningModule):
     """
@@ -33,7 +32,7 @@ class R2GenGPT(pl.LightningModule):
                                     r=args.vis_r,
                                     lora_alpha=args.vis_alpha,
                                     target_modules=["query", "value"],
-                                    lora_dropout=args.lora_dropout,
+                                    lora_dropout=args.vis_lora_dropout,
                                     bias="none",
                                     modules_to_save=["classifier"],
                                 )
@@ -55,7 +54,6 @@ class R2GenGPT(pl.LightningModule):
         print('Loading LLAMA model...')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
         self.llama_tokenizer.pad_token_id = 0
-
         # ============================================================
         # 🔹 Case 1: Low-resource mode → 4-bit + QLoRA
         # ============================================================
@@ -65,7 +63,7 @@ class R2GenGPT(pl.LightningModule):
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_compute_dtype=torch.float32,
                 bnb_4bit_use_double_quant=True,
             )
 
@@ -75,7 +73,6 @@ class R2GenGPT(pl.LightningModule):
                 quantization_config=bnb_config,
                 torch_dtype=torch.float16,
                 device_map=None,   # ❌ jangan "auto" (DDP unsafe)
-                low_cpu_mem_usage=True
             )
 
             # ✅ Tambahkan LoRA (QLoRA)
@@ -86,9 +83,10 @@ class R2GenGPT(pl.LightningModule):
                 inference_mode=False,
                 r=args.llm_r,
                 lora_alpha=args.llm_alpha,
-                lora_dropout=args.lora_dropout,
+                lora_dropout=args.llm_lora_dropout,
                 bias="none",
-                # target_modules=["q_proj", "v_proj"]
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
+
             )
             self.llama_model = get_peft_model(self.llama_model, peft_config)
             self.llama_model.print_trainable_parameters()
@@ -278,6 +276,40 @@ class R2GenGPT(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         result = self(batch)
         self.log_dict(result, prog_bar=True)
+
+        rank = self.global_rank
+        device_idx = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+
+        # ============================================================
+        # ✅ GPU VRAM (GB)
+        # ============================================================
+        gpu_vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        self.log(f"gpu_vram_gb/r{rank}", gpu_vram_gb,
+                on_step=True, on_epoch=False, sync_dist=False)
+
+        # ✅ GPU VRAM (%)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        gpu_vram_pct = (mem_info.used / mem_info.total) * 100
+        self.log(f"gpu_vram_pct/r{rank}", gpu_vram_pct,
+                on_step=True, on_epoch=False, sync_dist=False)
+
+        # ✅ GPU Util (%)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        self.log(f"gpu_util_pct/r{rank}", util,
+                on_step=True, on_epoch=False, sync_dist=False)
+
+        # ============================================================
+        # ✅ CPU RAM per-epoch (GB & %)
+        # ============================================================
+        mem = psutil.virtual_memory()
+
+        self.log("cpu_ram_gb", mem.used / (1024 ** 3),
+                on_step=False, on_epoch=True, sync_dist=False)
+
+        self.log("cpu_ram_pct", mem.percent,
+                on_step=False, on_epoch=True, sync_dist=False)
+
         return result
 
     def save_checkpoint(self, eval_res):
@@ -365,35 +397,39 @@ class R2GenGPT(pl.LightningModule):
         ref = {k:[v] for k, v in zip(ids, ref)}
         hypo = {k:[v] for k, v in zip(ids, hypo)}
         eval_res = self.score(ref=ref,hypo=hypo)
-        # ====================================================
-        # 🔹 Sinkronisasi antar GPU (agar eval_res global)
-        # ====================================================
-        if torch.distributed.is_initialized():
-            for k, v in eval_res.items():
-                t = torch.tensor(v, dtype=torch.float32, device=self.device)
-                torch.distributed.all_reduce(t, op=torch.distributed.ReduceOp.AVG)
-                eval_res[k] = t.item()
-        self.log_dict(eval_res, sync_dist=True, logger=True)
+        
+        # 🔄 Sinkron antar GPU (tanpa all_reduce manual)
+        for k, v in eval_res.items():
+            eval_res[k] = self.trainer.strategy.reduce(v, reduce_op="mean")
+            
+        self.log_dict(eval_res, sync_dist=False, logger=True)
 
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
-        json.dump(hypo, open(os.path.join(result_folder, f"result_{current_epoch}_{global_step}" + '.json'), 'w'))
-        json.dump(ref, open(os.path.join(result_folder, 'refs.json'), 'w'))
+        # ⬇️ Tambahkan rank di nama file agar tidak tabrakan
+        rank = self.global_rank if hasattr(self, "global_rank") else 0
+        json.dump(hypo, open(os.path.join(result_folder, f"result_rank{rank}_{current_epoch}_{global_step}.json"), "w"))
+        json.dump(ref, open(os.path.join(result_folder, f"refs_rank{rank}.json"), "w"))
+        self.print(eval_res)
 
-        val_score = 0
+        val_score = 0.0
         for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):
             val_score += eval_res[score_type] * weight
 
-        if self.trainer.global_rank == 0:
-            self.print(f"[Sync across {torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1} GPUs] "
-                   f"{ {**eval_res, 'val_score': val_score} }")
+        # 🔄 Sinkronkan val_score antar GPU (mean semua rank)
+        val_score = self.trainer.strategy.reduce(val_score, reduce_op="mean")
+
+        # 💾 Simpan checkpoint hanya di rank 0, tapi berdasarkan val_score global
+        if self.trainer.is_global_zero:
             if val_score > self.val_score:
                 self.save_checkpoint(eval_res)
                 self.val_score = val_score
+
+        # 🧹 Bersihkan buffer
         self.val_step_outputs.clear()
-
-
+        
+        
     def test_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
         to_regress_tokens = self.llama_tokenizer(
@@ -458,8 +494,16 @@ class R2GenGPT(pl.LightningModule):
         self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.hparams.max_epochs, eta_min=1e-6)
+        total_steps = self.trainer.estimated_stepping_batches
+        warmup_steps = int(self.hparams.warmup_ratio * total_steps)
+
+        optimizer, scheduler = config_optimizer(
+            parameters=self.parameters(),
+            init_lr=self.hparams.learning_rate,
+            warmup_steps=warmup_steps,
+            max_steps=total_steps,
+        )
+
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def get_progress_bar_dict(self):
