@@ -63,7 +63,7 @@ class R2GenGPT(pl.LightningModule):
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_quant_type="nf4",
-                bnb_4bit_compute_dtype=torch.float32,
+                bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
             )
 
@@ -85,7 +85,7 @@ class R2GenGPT(pl.LightningModule):
                 lora_alpha=args.llm_alpha,
                 lora_dropout=args.llm_lora_dropout,
                 bias="none",
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj"]
+                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
 
             )
             self.llama_model = get_peft_model(self.llama_model, peft_config)
@@ -167,7 +167,44 @@ class R2GenGPT(pl.LightningModule):
             # Load ke model
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
+    
+    # ========== GLOBAL LOGGING UNTUK 2 GPU (GPU0 + GPU1) ==========
+    def _log_gpu_cpu_epoch(self, prefix):
+        """
+        Minimal logging:
+        - gpu0_vram  (GB)
+        - gpu1_vram  (GB)
+        - cpu_ram    (GB)
 
+        Hanya rank0 yang menulis ke CSV.
+        """
+        device_idx = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+
+        # VRAM per-rank (satuan GB)
+        gpu_vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
+        vram_t = torch.tensor(gpu_vram_gb, device=torch.device(f"cuda:{device_idx}"))
+
+        # Kumpulkan ke rank0
+        vram_all = self.all_gather(vram_t).detach()
+
+        if self.trainer.is_global_zero:
+            vram_list = vram_all.flatten().tolist()
+
+            gpu0_vram = float(vram_list[0]) if len(vram_list) >= 1 else 0.0
+            gpu1_vram = float(vram_list[1]) if len(vram_list) >= 2 else 0.0
+
+            self.log(f"{prefix}_gpu0_vram", gpu0_vram,
+                    on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_vram", gpu1_vram,
+                    on_step=False, on_epoch=True, rank_zero_only=True)
+
+            # CPU global
+            mem = psutil.virtual_memory()
+            cpu_ram_gb = mem.used / (1024 ** 3)
+
+            self.log(f"{prefix}_cpu_ram", cpu_ram_gb,
+                    on_step=False, on_epoch=True, rank_zero_only=True)
 
 
     def score(self, ref, hypo):
@@ -276,41 +313,10 @@ class R2GenGPT(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         result = self(batch)
         self.log_dict(result, prog_bar=True)
-
-        rank = self.global_rank
-        device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-
-        # ============================================================
-        # ✅ GPU VRAM (GB)
-        # ============================================================
-        gpu_vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-        self.log(f"gpu_vram_gb/r{rank}", gpu_vram_gb,
-                on_step=True, on_epoch=False, sync_dist=False)
-
-        # ✅ GPU VRAM (%)
-        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
-        gpu_vram_pct = (mem_info.used / mem_info.total) * 100
-        self.log(f"gpu_vram_pct/r{rank}", gpu_vram_pct,
-                on_step=True, on_epoch=False, sync_dist=False)
-
-        # ✅ GPU Util (%)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
-        self.log(f"gpu_util_pct/r{rank}", util,
-                on_step=True, on_epoch=False, sync_dist=False)
-
-        # ============================================================
-        # ✅ CPU RAM per-epoch (GB & %)
-        # ============================================================
-        mem = psutil.virtual_memory()
-
-        self.log("cpu_ram_gb", mem.used / (1024 ** 3),
-                on_step=False, on_epoch=True, sync_dist=False)
-
-        self.log("cpu_ram_pct", mem.percent,
-                on_step=False, on_epoch=True, sync_dist=False)
-
         return result
+        
+    def on_train_epoch_end(self):
+        self._log_gpu_cpu_epoch("train")
 
     def save_checkpoint(self, eval_res):
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
@@ -428,6 +434,7 @@ class R2GenGPT(pl.LightningModule):
 
         # 🧹 Bersihkan buffer
         self.val_step_outputs.clear()
+        self._log_gpu_cpu_epoch("val")
         
         
     def test_step(self, samples, batch_idx):

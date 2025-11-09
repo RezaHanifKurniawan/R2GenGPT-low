@@ -33,7 +33,7 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, functools.partial(lr_lambda, num_warmup_steps=num_warmup_steps, num_training_steps=num_training_steps), last_epoch)
 
 
-def config_optimizer(parameters, init_lr, warmup_steps, max_steps, name='lr'):
+def config_optimizer(parameters, init_lr, warmup_steps, max_steps, name='lr', weight_decay=0.01):
     """
     Original Bert Optimizer do not decay for bias and layer_normal
     Args:
@@ -48,7 +48,7 @@ def config_optimizer(parameters, init_lr, warmup_steps, max_steps, name='lr'):
 
     """
     optimizer = AdamW(
-        parameters, lr=init_lr, eps=1e-8
+        parameters, lr=init_lr, eps=1e-6, betas=(0.9, 0.98), weight_decay=weight_decay
     )
 
     scheduler = get_linear_schedule_with_warmup(
