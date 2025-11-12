@@ -152,6 +152,8 @@ class R2GenGPT(pl.LightningModule):
         self.prompt = 'Generate a comprehensive and detailed diagnosis report for this chest xray image.'
         self.val_step_outputs = []
         self.test_step_outputs = []
+        self._epoch_vram = []
+        self._epoch_util = []
         self.val_score = 0.0
 
         if args.delta_file is not None:
@@ -167,44 +169,57 @@ class R2GenGPT(pl.LightningModule):
             # Load ke model
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
-    
-    # ========== GLOBAL LOGGING UNTUK 2 GPU (GPU0 + GPU1) ==========
+            
+    # =========================LOGGING GPU & CPU UTILIZATION=========================          
     def _log_gpu_cpu_epoch(self, prefix):
         """
-        Minimal logging:
-        - gpu0_vram  (GB)
-        - gpu1_vram  (GB)
-        - cpu_ram    (GB)
-
-        Hanya rank0 yang menulis ke CSV.
+        prefix: train / val
+        Mengumpulkan:
+        - avg vram dalam 1 epoch
+        - peak vram dalam 1 epoch
+        - avg util
+        - peak util
+        untuk 2 GPU melalui all_gather
         """
-        device_idx = torch.cuda.current_device()
-        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
 
-        # VRAM per-rank (satuan GB)
-        gpu_vram_gb = torch.cuda.memory_allocated() / (1024 ** 3)
-        vram_t = torch.tensor(gpu_vram_gb, device=torch.device(f"cuda:{device_idx}"))
+        # local values
+        avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
+        peak_vram_local = float(max(self._epoch_vram))
 
-        # Kumpulkan ke rank0
-        vram_all = self.all_gather(vram_t).detach()
+        avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
+        peak_util_local = float(max(self._epoch_util))
 
+        # convert to tensors for gathering
+        t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
+        t_peak_vram = torch.tensor(peak_vram_local, device=self.device)
+        t_avg_util = torch.tensor(avg_util_local, device=self.device)
+        t_peak_util = torch.tensor(peak_util_local, device=self.device)
+
+        # all ranks gather → shape (world_size,)
+        all_avg_vram = self.all_gather(t_avg_vram).detach().cpu().tolist()
+        all_peak_vram = self.all_gather(t_peak_vram).detach().cpu().tolist()
+
+        all_avg_util = self.all_gather(t_avg_util).detach().cpu().tolist()
+        all_peak_util = self.all_gather(t_peak_util).detach().cpu().tolist()
+
+        # only rank 0 logs
         if self.trainer.is_global_zero:
-            vram_list = vram_all.flatten().tolist()
+            # GPU0 = index 0, GPU1 = index 1
+            self.log(f"{prefix}_gpu0_avg_vram", all_avg_vram[0], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_avg_vram", all_avg_vram[1], on_epoch=True, rank_zero_only=True)
 
-            gpu0_vram = float(vram_list[0]) if len(vram_list) >= 1 else 0.0
-            gpu1_vram = float(vram_list[1]) if len(vram_list) >= 2 else 0.0
+            self.log(f"{prefix}_gpu0_peak_vram", all_peak_vram[0], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_peak_vram", all_peak_vram[1], on_epoch=True, rank_zero_only=True)
 
-            self.log(f"{prefix}_gpu0_vram", gpu0_vram,
-                    on_step=False, on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_vram", gpu1_vram,
-                    on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu0_avg_util", all_avg_util[0], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_avg_util", all_avg_util[1], on_epoch=True, rank_zero_only=True)
 
-            # CPU global
+            self.log(f"{prefix}_gpu0_peak_util", all_peak_util[0], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_peak_util", all_peak_util[1], on_epoch=True, rank_zero_only=True)
+
+            # CPU snapshot tetap
             mem = psutil.virtual_memory()
-            cpu_ram_gb = mem.used / (1024 ** 3)
-
-            self.log(f"{prefix}_cpu_ram", cpu_ram_gb,
-                    on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)
 
 
     def score(self, ref, hypo):
@@ -309,10 +324,25 @@ class R2GenGPT(pl.LightningModule):
         )
         loss = outputs.loss
         return {"loss": loss}
+    
+    def on_train_epoch_start(self):
+        self._epoch_vram = []
+        self._epoch_util = []
 
     def training_step(self, batch, batch_idx):
         result = self(batch)
         self.log_dict(result, prog_bar=True)
+
+        # track vram per-step
+        device_idx = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+
+        vram = torch.cuda.memory_allocated() / (1024 ** 3)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+
+        self._epoch_vram.append(vram)
+        self._epoch_util.append(util)
+
         return result
         
     def on_train_epoch_end(self):
@@ -341,7 +371,10 @@ class R2GenGPT(pl.LightningModule):
         self.print("Saving checkpoint at step {} to {}.".format(global_step, save_to))
         torch.save(save_obj, save_to)
         
-    
+    def on_validation_epoch_start(self):
+        self._epoch_vram = []
+        self._epoch_util = []
+        
     def validation_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
         to_regress_tokens = self.llama_tokenizer(
@@ -381,6 +414,16 @@ class R2GenGPT(pl.LightningModule):
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.val_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
+        
+        device_idx = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+
+        vram = torch.cuda.memory_allocated() / (1024 ** 3)
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+
+        self._epoch_vram.append(vram)
+        self._epoch_util.append(util)
+
         return hypo, ref
     
     def decode(self, output_token):
@@ -501,16 +544,8 @@ class R2GenGPT(pl.LightningModule):
         self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
 
     def configure_optimizers(self):
-        total_steps = self.trainer.estimated_stepping_batches
-        warmup_steps = int(self.hparams.warmup_ratio * total_steps)
-
-        optimizer, scheduler = config_optimizer(
-            parameters=self.parameters(),
-            init_lr=self.hparams.learning_rate,
-            warmup_steps=warmup_steps,
-            max_steps=total_steps,
-        )
-
+        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.hparams.max_epochs, eta_min=1e-6)
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def get_progress_bar_dict(self):
