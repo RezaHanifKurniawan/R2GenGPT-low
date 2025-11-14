@@ -11,9 +11,9 @@ from evalcap.rouge.rouge import Rouge
 from evalcap.cider.cider import Cider
 from evalcap.meteor.meteor import Meteor
 from transformers import SwinModel
-from lightning_tools.optim import config_optimizer
 from peft import get_peft_model, LoraConfig, TaskType
-import pynvml, psutil
+import numpy as np
+import pynvml, psutil, time, csv
 pynvml.nvmlInit()
 
 class R2GenGPT(pl.LightningModule):
@@ -154,6 +154,9 @@ class R2GenGPT(pl.LightningModule):
         self.test_step_outputs = []
         self._epoch_vram = []
         self._epoch_util = []
+        self.test_latencies = []
+        self.test_utils = []
+        self.test_vrams = []
         self.val_score = 0.0
 
         if args.delta_file is not None:
@@ -170,7 +173,7 @@ class R2GenGPT(pl.LightningModule):
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
             
-    # =========================LOGGING GPU & CPU UTILIZATION=========================          
+    # =========================LOGGING GPU & CPU UTILIZATION TRAIN & VAL=========================          
     def _log_gpu_cpu_epoch(self, prefix):
         """
         prefix: train / val
@@ -219,8 +222,7 @@ class R2GenGPT(pl.LightningModule):
 
             # CPU snapshot tetap
             mem = psutil.virtual_memory()
-            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)
-
+            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)           
 
     def score(self, ref, hypo):
         """
@@ -481,6 +483,7 @@ class R2GenGPT(pl.LightningModule):
         
         
     def test_step(self, samples, batch_idx):
+        start = time.time()
         self.llama_tokenizer.padding_side = "right"
         to_regress_tokens = self.llama_tokenizer(
             samples['input_text'],
@@ -516,6 +519,22 @@ class R2GenGPT(pl.LightningModule):
             length_penalty=self.hparams.length_penalty,
             temperature=self.hparams.temperature, 
         )
+        # --- timing end ---
+        end = time.time()
+        latency = end - start
+
+        # ===== GPU UTIL + VRAM =====
+        device_idx = torch.cuda.current_device()
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+
+        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        vram = pynvml.nvmlDeviceGetMemoryInfo(handle).used / 1024**3
+
+        # ===== Simpan untuk perhitungan final =====
+        self.test_latencies.append(latency)
+        self.test_utils.append(util)
+        self.test_vrams.append(vram)
+        
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
         self.test_step_outputs.append({"hypo": hypo, "ref": ref, "id": samples["id"]})
@@ -542,10 +561,44 @@ class R2GenGPT(pl.LightningModule):
         json.dump(hypo, open(os.path.join(result_folder, f"test_result.json"), 'w'))
         json.dump(ref, open(os.path.join(result_folder, 'test_refs.json'), 'w'))
         self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
+        # ======== PERFORMANCE LOGGING =========
+        avg_lat = float(np.mean(self.test_latencies))
+        std_lat = float(np.std(self.test_latencies))
+        throughput = 1.0 / avg_lat if avg_lat > 0 else 0.0
+        avg_util = float(np.mean(self.test_utils))
+        peak_util = float(np.max(self.test_utils))
+        avg_vram = float(np.mean(self.test_vrams))
+        peak_vram = float(np.max(self.test_vrams))
+
+        csv_path = os.path.join(self.hparams.savedmodel_path, "latensi-test.csv")
+        header = [
+            "avg_latency", "std_latency", "throughput",
+            "avg_util", "peak_util", "avg_vram", "peak_vram"
+        ]
+        data = [avg_lat, std_lat, throughput,
+                avg_util, peak_util, avg_vram, peak_vram]
+
+        file_exists = os.path.exists(csv_path)
+        with open(csv_path, "a", newline="") as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(header)
+            writer.writerow(data)
+        self.print(f"[INFO] Saved latency metrics → {csv_path}")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(self.parameters(), lr=self.hparams.learning_rate)
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer=optimizer, T_max=self.hparams.max_epochs, eta_min=1e-6)
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.hparams.learning_rate,
+            eps=1e-6,
+            betas=(0.9, 0.999),
+            weight_decay=0.01
+        )
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer=optimizer,
+            T_max=self.hparams.max_epochs,
+            eta_min=1e-6
+        )
         return {"optimizer": optimizer, "lr_scheduler": scheduler}
 
     def get_progress_bar_dict(self):
