@@ -12,6 +12,7 @@ from evalcap.cider.cider import Cider
 from evalcap.meteor.meteor import Meteor
 from transformers import SwinModel
 from peft import get_peft_model, LoraConfig, TaskType
+from lightning_tools.optim import config_optimizer
 import numpy as np
 import pynvml, psutil, time, csv
 pynvml.nvmlInit()
@@ -85,7 +86,7 @@ class R2GenGPT(pl.LightningModule):
                 lora_alpha=args.llm_alpha,
                 lora_dropout=args.llm_lora_dropout,
                 bias="none",
-                target_modules=["q_proj", "k_proj", "v_proj", "o_proj"]
+                target_modules=["q_proj","v_proj", "o_proj", "k_proj"],
 
             )
             self.llama_model = get_peft_model(self.llama_model, peft_config)
@@ -468,9 +469,6 @@ class R2GenGPT(pl.LightningModule):
         for score_type, weight in zip(self.hparams.scorer_types, self.hparams.weights):
             val_score += eval_res[score_type] * weight
 
-        # 🔄 Sinkronkan val_score antar GPU (mean semua rank)
-        val_score = self.trainer.strategy.reduce(val_score, reduce_op="mean")
-
         # 💾 Simpan checkpoint hanya di rank 0, tapi berdasarkan val_score global
         if self.trainer.is_global_zero:
             if val_score > self.val_score:
@@ -587,19 +585,31 @@ class R2GenGPT(pl.LightningModule):
         self.print(f"[INFO] Saved latency metrics → {csv_path}")
 
     def configure_optimizers(self):
-        optimizer = torch.optim.AdamW(
-            self.parameters(),
-            lr=self.hparams.learning_rate,
-            eps=1e-6,
-            betas=(0.9, 0.999),
-            weight_decay=0.01
+
+        # ------------------------------
+        # Hitung total training steps
+        # ------------------------------
+        total_steps = self.trainer.estimated_stepping_batches
+
+        # Warmup 3% (opsi aman untuk QLoRA, IU-Xray kecil)
+        warmup_steps = int(total_steps * 0.010)
+        warmup_steps = min(max(warmup_steps, 10), total_steps - 1)
+
+        # ------------------------------
+        # Optimizer & Scheduler
+        # ------------------------------
+        optimizer, scheduler = config_optimizer(
+            parameters=self.parameters(),
+            init_lr=self.hparams.learning_rate,
+            warmup_steps=warmup_steps,
+            max_steps=total_steps,
+            name="lr"
         )
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer=optimizer,
-            T_max=self.hparams.max_epochs,
-            eta_min=1e-6
-        )
-        return {"optimizer": optimizer, "lr_scheduler": scheduler}
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": scheduler
+        }
 
     def get_progress_bar_dict(self):
         # don't show the version number
