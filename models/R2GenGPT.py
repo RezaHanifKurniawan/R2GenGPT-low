@@ -40,6 +40,7 @@ class R2GenGPT(pl.LightningModule):
             self.visual_encoder = get_peft_model(self.visual_encoder, peft_config_visual)
             self.visual_encoder.print_trainable_parameters()
             print('Loading vision encoder with LoRA -- Done')
+            
         elif args.freeze_vm:
             for name, param in self.visual_encoder.named_parameters():
                 param.requires_grad = False
@@ -52,6 +53,7 @@ class R2GenGPT(pl.LightningModule):
             total_params = sum(p.numel() for p in self.visual_encoder.parameters())
             print(f"[Vision Encoder] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
             print(f'Loading Full Trainable vision encoder:{args.vision_model} -- Done')
+                
         print('Loading LLAMA model...')
         self.llama_tokenizer = LlamaTokenizer.from_pretrained(args.llama_model, use_fast=False)
         self.llama_tokenizer.pad_token_id = 0
@@ -92,40 +94,9 @@ class R2GenGPT(pl.LightningModule):
             self.llama_model = get_peft_model(self.llama_model, peft_config)
             self.llama_model.print_trainable_parameters()
             print("Loading 4-bit QLoRA LLAMA Done ✅")
-            
+                    
         # ============================================================
-        # 🔹 Case 2: Fake QAT + Freeze (lm_head only)
-        # ============================================================
-        elif args.fake_qat:
-            print("→ Fake QAT Simulasi INT8 aktif (lm_head only, clean mode)")
-
-            # 1️⃣ Load model di FP16
-            self.llama_model = LlamaForCausalLM.from_pretrained(
-                args.llama_model,
-                torch_dtype=torch.float16,
-                device_map=None,
-            )
-            self.llama_model.eval()  # stabilisasi LayerNorm dan Dropout
-
-            # 2️⃣ Freeze semua parameter (hemat & aman)
-            for name, param in self.llama_model.named_parameters():
-                param.requires_grad = False
-
-            # 3️⃣ Fake quantisasi simulasi pada lm_head
-            w = self.llama_model.lm_head.weight.data
-            qmin, qmax = -128, 127
-            scale = w.abs().max() / max(qmax, 1)
-            w_q = torch.clamp((w / scale).round(), qmin, qmax) * scale
-            self.llama_model.lm_head.weight.data.copy_(w_q)
-            print("✅ Fake QAT simulated on lm_head weights (INT8 emulation, no observer)")
-
-            # 4️⃣ Ambil embedding
-            self.embed_tokens = self.llama_model.get_input_embeddings()
-            print("✅ LLaMA frozen, Fake QAT ready (FP16 compute, INT8-like behavior)")
-
-        
-        # ============================================================
-        # 🔹 Case 3: Full mode → FP16 (no quantization, no LoRA)
+        # 🔹 Case 2: Full mode → FP16 (no quantization, no LoRA)
         # ============================================================
         else:
             print("→ Full precision mode detected: loading FP16 model")
@@ -143,7 +114,7 @@ class R2GenGPT(pl.LightningModule):
             total_params = sum(p.numel() for p in self.llama_model.parameters())
             print(f"[LLM] trainable params: {trainable_params:,} || all params: {total_params:,} || trainable%: {100 * trainable_params / total_params:.4f}")
             print("Loading FP16 LLAMA Done ✅")
-
+        
         # ============================================================
         # Linear projection for visual features → LLAMA space
         # ============================================================
@@ -158,6 +129,8 @@ class R2GenGPT(pl.LightningModule):
         self.test_latencies = []
         self.test_utils = []
         self.test_vrams = []
+        self._train_epoch_start_time = None
+        self._val_epoch_start_time = None
         self.val_score = 0.0
 
         if args.delta_file is not None:
@@ -205,25 +178,31 @@ class R2GenGPT(pl.LightningModule):
 
         all_avg_util = self.all_gather(t_avg_util).detach().cpu().tolist()
         all_peak_util = self.all_gather(t_peak_util).detach().cpu().tolist()
+        
+        # formatting & logging
+        all_avg_vram = [round(v, 2) for v in all_avg_vram]   # GB
+        all_peak_vram = [round(v, 2) for v in all_peak_vram] # GB
+        all_avg_util = [round(v, 1) for v in all_avg_util]   # %
+        all_peak_util = [round(v, 1) for v in all_peak_util] # %
 
         # only rank 0 logs
         if self.trainer.is_global_zero:
             # GPU0 = index 0, GPU1 = index 1
-            self.log(f"{prefix}_gpu0_avg_vram", all_avg_vram[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_vram", all_avg_vram[1], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu0_avg_vram", all_avg_vram[0], on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_avg_vram", all_avg_vram[1], on_step=False, on_epoch=True, rank_zero_only=True)
 
-            self.log(f"{prefix}_gpu0_peak_vram", all_peak_vram[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_vram", all_peak_vram[1], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu0_peak_vram", all_peak_vram[0], on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_peak_vram", all_peak_vram[1], on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu0_avg_util", all_avg_util[0], on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_avg_util", all_avg_util[1], on_step=False, on_epoch=True, rank_zero_only=True)
 
-            self.log(f"{prefix}_gpu0_avg_util", all_avg_util[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_util", all_avg_util[1], on_epoch=True, rank_zero_only=True)
-
-            self.log(f"{prefix}_gpu0_peak_util", all_peak_util[0], on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_util", all_peak_util[1], on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu0_peak_util", all_peak_util[0], on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu1_peak_util", all_peak_util[1], on_step=False, on_epoch=True, rank_zero_only=True)
 
             # CPU snapshot tetap
             mem = psutil.virtual_memory()
-            self.log(f"{prefix}_cpu_ram", mem.used / (1024 ** 3), on_epoch=True, rank_zero_only=True)           
+            cpu_ram_gb = round(mem.used / (1024 ** 3), 2)
+            self.log(f"{prefix}_cpu_ram", cpu_ram_gb, on_step=False, on_epoch=True, rank_zero_only=True)         
 
     def score(self, ref, hypo):
         """
@@ -331,10 +310,12 @@ class R2GenGPT(pl.LightningModule):
     def on_train_epoch_start(self):
         self._epoch_vram = []
         self._epoch_util = []
+        # catat waktu mulai epoch train (dalam detik)
+        self._train_epoch_start_time = time.time()
 
     def training_step(self, batch, batch_idx):
         result = self(batch)
-        self.log_dict(result, prog_bar=True)
+        self.log("train_loss", result["loss"], on_step=True, on_epoch=False, prog_bar=True,logger=True)
 
         # track vram per-step
         device_idx = torch.cuda.current_device()
@@ -346,9 +327,16 @@ class R2GenGPT(pl.LightningModule):
         self._epoch_vram.append(vram)
         self._epoch_util.append(util)
 
-        return result
+        return result["loss"]
         
     def on_train_epoch_end(self):
+        # hitung waktu epoch train dalam jam
+        if self._train_epoch_start_time is not None:
+            train_epoch_time_sec = time.time() - self._train_epoch_start_time
+            train_epoch_time_hr = train_epoch_time_sec / 3600.0  # konversi ke jam
+            train_epoch_time_hr = round(train_epoch_time_hr, 2) # pembulatan 2 desimal
+
+            self.log("train_epoch_time", float(train_epoch_time_hr), on_step=False, on_epoch=True, rank_zero_only=True)
         self._log_gpu_cpu_epoch("train")
 
     def save_checkpoint(self, eval_res):
@@ -377,6 +365,7 @@ class R2GenGPT(pl.LightningModule):
     def on_validation_epoch_start(self):
         self._epoch_vram = []
         self._epoch_util = []
+        self._val_epoch_start_time = time.time()
         
     def validation_step(self, samples, batch_idx):
         self.llama_tokenizer.padding_side = "right"
@@ -477,6 +466,15 @@ class R2GenGPT(pl.LightningModule):
 
         # 🧹 Bersihkan buffer
         self.val_step_outputs.clear()
+        # hitung waktu epoch val dalam jam
+        if self._val_epoch_start_time is not None:
+            val_epoch_time_sec = time.time() - self._val_epoch_start_time
+            val_epoch_time_hr = val_epoch_time_sec / 3600.0
+            val_epoch_time_hr = round(val_epoch_time_hr, 2)  # contoh: 0.50, 0.83, 1.75
+
+            self.log("val_epoch_time", float(val_epoch_time_hr), on_step=False, on_epoch=True, rank_zero_only=True)
+
+        # log vram/util per-epoch
         self._log_gpu_cpu_epoch("val")
         
         
@@ -560,15 +558,33 @@ class R2GenGPT(pl.LightningModule):
         json.dump(ref, open(os.path.join(result_folder, 'test_refs.json'), 'w'))
         self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
         # ======== PERFORMANCE LOGGING =========
-        avg_lat = float(np.mean(self.test_latencies))
-        std_lat = float(np.std(self.test_latencies))
+        avg_lat = float(np.mean(self.test_latencies)) if self.test_latencies else 0.0
+        std_lat = float(np.std(self.test_latencies)) if self.test_latencies else 0.0
         throughput = 1.0 / avg_lat if avg_lat > 0 else 0.0
-        avg_util = float(np.mean(self.test_utils))
-        peak_util = float(np.max(self.test_utils))
-        avg_vram = float(np.mean(self.test_vrams))
-        peak_vram = float(np.max(self.test_vrams))
 
-        csv_path = os.path.join(self.hparams.savedmodel_path, "latensi-test.csv")
+        avg_util = float(np.mean(self.test_utils)) if self.test_utils else 0.0
+        peak_util = float(np.max(self.test_utils)) if self.test_utils else 0.0
+
+        avg_vram = float(np.mean(self.test_vrams)) if self.test_vrams else 0.0
+        peak_vram = float(np.max(self.test_vrams)) if self.test_vrams else 0.0
+
+        # ==== PEMBULATAN FORMAT ====
+        # waktu dalam detik, 3 desimal
+        avg_lat = round(avg_lat, 3)
+        std_lat = round(std_lat, 3)
+
+        # throughput (batch/s), 5 desimal
+        throughput = round(throughput, 5)
+
+        # util dalam persen, 1 desimal
+        avg_util = round(avg_util, 1)
+        peak_util = round(peak_util, 1)
+
+        # VRAM dalam GB, 2 desimal
+        avg_vram = round(avg_vram, 2)
+        peak_vram = round(peak_vram, 2)
+
+        # Simpan ke CSV
         header = [
             "avg_latency", "std_latency", "throughput",
             "avg_util", "peak_util", "avg_vram", "peak_vram"
@@ -576,13 +592,15 @@ class R2GenGPT(pl.LightningModule):
         data = [avg_lat, std_lat, throughput,
                 avg_util, peak_util, avg_vram, peak_vram]
 
-        file_exists = os.path.exists(csv_path)
-        with open(csv_path, "a", newline="") as f:
+        csv_path = os.path.join(self.hparams.savedmodel_path, "test_perf_metrics.csv")
+
+        # pakai "w" biar selalu overwrite per run
+        with open(csv_path, mode="w", newline="") as f:
             writer = csv.writer(f)
-            if not file_exists:
-                writer.writerow(header)
+            writer.writerow(header)
             writer.writerow(data)
-        self.print(f"[INFO] Saved latency metrics → {csv_path}")
+
+        print(f"Saved test performance metrics to {csv_path}")
 
     def configure_optimizers(self):
 
@@ -591,8 +609,8 @@ class R2GenGPT(pl.LightningModule):
         # ------------------------------
         total_steps = self.trainer.estimated_stepping_batches
 
-        # Warmup 3% (opsi aman untuk QLoRA, IU-Xray kecil)
-        warmup_steps = int(total_steps * 0.010)
+        # Warmup 5% (opsi aman untuk QLoRA, IU-Xray kecil)
+        warmup_steps = int(total_steps * 0.05)
         warmup_steps = min(max(warmup_steps, 10), total_steps - 1)
 
         # ------------------------------

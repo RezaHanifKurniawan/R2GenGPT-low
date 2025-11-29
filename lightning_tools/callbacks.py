@@ -27,7 +27,7 @@ def add_callbacks(args):
 
     early_stop_callback = EarlyStopping(
         monitor="Bleu_4",
-        patience=8,
+        patience=7,
         mode="max"
     )
 

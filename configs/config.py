@@ -25,7 +25,6 @@ parser.add_argument('--vis_alpha', default=16, type=int, help='Scaling factor.')
 parser.add_argument('--llm_lora_dropout', default=0.1, type=float, help='lora dropout')
 parser.add_argument('--vis_lora_dropout', default=0.1, type=float, help='lora dropout')
 parser.add_argument('--global_only', default=False, type=lambda x: (str(x).lower() == 'true'), help='use global embedding only')
-parser.add_argument('--fake_qat', default=False, type=bool, help='use fake quantization aware training')
 parser.add_argument('--low_resource', default=False, type=bool, help='use low resource mode (qlora)')
 parser.add_argument('--end_sym', default='</s>', type=str)
 

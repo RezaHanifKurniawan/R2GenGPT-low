@@ -51,7 +51,7 @@ def config_optimizer(parameters, init_lr, warmup_steps, max_steps, name='lr'):
     warmup_steps = min(warmup_steps, max_steps - 1)
     
     optimizer = AdamW(
-        parameters, lr=init_lr, eps=1e-8, weight_decay=0.0
+        parameters, lr=init_lr, eps=1e-8, weight_decay=0.01
     )
 
     scheduler = get_linear_schedule_with_warmup(
