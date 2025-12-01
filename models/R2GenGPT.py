@@ -120,18 +120,43 @@ class R2GenGPT(pl.LightningModule):
         # ============================================================
         self.llama_proj = nn.Linear(self.visual_encoder.num_features, self.llama_model.config.hidden_size)
         self.layer_norm = nn.LayerNorm(self.llama_model.config.hidden_size)
+        # ============================================================
+        # Print parameter info untuk Visual Mapper
+        # ============================================================
+        mapper_params = sum(p.numel() for p in self.llama_proj.parameters()) \
+                    + sum(p.numel() for p in self.layer_norm.parameters())
+
+        mapper_trainable = sum(p.numel() for p in self.llama_proj.parameters() if p.requires_grad) \
+                        + sum(p.numel() for p in self.layer_norm.parameters() if p.requires_grad)
+
+        print(f"[Visual Mapper] trainable params: {mapper_trainable:,} "
+            f"|| all params: {mapper_params:,} "
+            f"|| trainable%: {100 * mapper_trainable / mapper_params:.4f}%")
+
+        # ============================================================
+        # Print TOTAL PARAMETERS (VE + Mapper + LLM)
+        # ============================================================
+        total_trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        total_all = sum(p.numel() for p in self.parameters())
+
+        print(f"[TOTAL ALIGNMENT] trainable params: {total_trainable:,} "
+            f"|| all params: {total_all:,} "
+            f"|| trainable%: {100 * total_trainable / total_all:.4f}%")
+
         self.end_sym = args.end_sym
         self.prompt = 'Generate a comprehensive and detailed diagnosis report for this chest xray image.'
-        self.val_step_outputs = []
-        self.test_step_outputs = []
-        self._epoch_vram = []
-        self._epoch_util = []
-        self.test_latencies = []
-        self.test_utils = []
-        self.test_vrams = []
+        # ====== buffers for training & validation ======
+        self.val_step_outputs = []         # untuk menyimpan hypo/ref per batch (val)
+        self._epoch_vram = []              # VRAM real per-step (train/val)
         self._train_epoch_start_time = None
         self._val_epoch_start_time = None
-        self.val_score = 0.0
+        self.val_score = 0.0               # best val score untuk save checkpoint
+
+        # ====== buffers for testing ======
+        self.test_step_outputs = []        # hypo/ref test
+        self.test_latencies = []           # latency per batch
+        self.test_vrams = []               # VRAM per batch
+        self.test_cpu_rams = []            # CPU RAM per batch
 
         if args.delta_file is not None:
             # Izinkan AttributeDict supaya tidak error saat load
@@ -147,62 +172,31 @@ class R2GenGPT(pl.LightningModule):
             self.load_state_dict(state_dict, strict=False)
             print(f'✅ Loaded checkpoint from {args.delta_file}')
             
-    # =========================LOGGING GPU & CPU UTILIZATION TRAIN & VAL=========================          
     def _log_gpu_cpu_epoch(self, prefix):
         """
-        prefix: train / val
-        Mengumpulkan:
-        - avg vram dalam 1 epoch
-        - peak vram dalam 1 epoch
-        - avg util
-        - peak util
-        untuk 2 GPU melalui all_gather
+        Logging peak VRAM & CPU RAM per epoch.
+        prefix = "train" atau "val"
         """
 
-        # local values
-        avg_vram_local = float(sum(self._epoch_vram) / max(1, len(self._epoch_vram)))
-        peak_vram_local = float(max(self._epoch_vram))
+        # Ambil VRAM real per-step (sudah disimpan ke self._epoch_vram)
+        peak_vram_local = float(max(self._epoch_vram)) if self._epoch_vram else 0.0
 
-        avg_util_local = float(sum(self._epoch_util) / max(1, len(self._epoch_util)))
-        peak_util_local = float(max(self._epoch_util))
+        # All-gather peak vram ke semua GPU
+        t_vram = torch.tensor(peak_vram_local, device=self.device)
+        all_vram = self.all_gather(t_vram).detach().cpu().tolist()  # [gpu0, gpu1]
 
-        # convert to tensors for gathering
-        t_avg_vram = torch.tensor(avg_vram_local, device=self.device)
-        t_peak_vram = torch.tensor(peak_vram_local, device=self.device)
-        t_avg_util = torch.tensor(avg_util_local, device=self.device)
-        t_peak_util = torch.tensor(peak_util_local, device=self.device)
-
-        # all ranks gather → shape (world_size,)
-        all_avg_vram = self.all_gather(t_avg_vram).detach().cpu().tolist()
-        all_peak_vram = self.all_gather(t_peak_vram).detach().cpu().tolist()
-
-        all_avg_util = self.all_gather(t_avg_util).detach().cpu().tolist()
-        all_peak_util = self.all_gather(t_peak_util).detach().cpu().tolist()
-        
-        # formatting & logging
-        all_avg_vram = [round(v, 2) for v in all_avg_vram]   # GB
-        all_peak_vram = [round(v, 2) for v in all_peak_vram] # GB
-        all_avg_util = [round(v, 1) for v in all_avg_util]   # %
-        all_peak_util = [round(v, 1) for v in all_peak_util] # %
-
-        # only rank 0 logs
         if self.trainer.is_global_zero:
-            # GPU0 = index 0, GPU1 = index 1
-            self.log(f"{prefix}_gpu0_avg_vram", all_avg_vram[0], on_step=False, on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_vram", all_avg_vram[1], on_step=False, on_epoch=True, rank_zero_only=True)
+            # VRAM real (GB) — format 2 desimal TANPA ROUND (truncate)
+            gpu0_vram = all_vram[0]
+            gpu1_vram = all_vram[1]
 
-            self.log(f"{prefix}_gpu0_peak_vram", all_peak_vram[0], on_step=False, on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_vram", all_peak_vram[1], on_step=False, on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu0_avg_util", all_avg_util[0], on_step=False, on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_avg_util", all_avg_util[1], on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log(f"{prefix}_gpu0_vram", gpu0_vram, on_step=False, on_epoch=True)
+            self.log(f"{prefix}_gpu1_vram", gpu1_vram, on_step=False, on_epoch=True)
 
-            self.log(f"{prefix}_gpu0_peak_util", all_peak_util[0], on_step=False, on_epoch=True, rank_zero_only=True)
-            self.log(f"{prefix}_gpu1_peak_util", all_peak_util[1], on_step=False, on_epoch=True, rank_zero_only=True)
-
-            # CPU snapshot tetap
+            # CPU RAM real (GB)
             mem = psutil.virtual_memory()
-            cpu_ram_gb = round(mem.used / (1024 ** 3), 2)
-            self.log(f"{prefix}_cpu_ram", cpu_ram_gb, on_step=False, on_epoch=True, rank_zero_only=True)         
+            cpu_ram = mem.used / (1024**3)
+            self.log(f"{prefix}_cpu_ram", cpu_ram, on_step=False, on_epoch=True)
 
     def score(self, ref, hypo):
         """
@@ -315,17 +309,20 @@ class R2GenGPT(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         result = self(batch)
-        self.log("train_loss", result["loss"], on_step=True, on_epoch=False, prog_bar=True,logger=True)
+        # Untuk progress bar — tampil tiap step
+        self.log("train_loss_step", result["loss"], on_step=True, on_epoch=False, prog_bar=True,logger=False)
+        
+        # Untuk logger — mean loss per epoch
+        self.log("train_loss", result["loss"], on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
         # track vram per-step
         device_idx = torch.cuda.current_device()
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
 
-        vram = torch.cuda.memory_allocated() / (1024 ** 3)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        # VRAM real usage
+        vram = pynvml.nvmlDeviceGetMemoryInfo(handle).used / (1024**3)
 
         self._epoch_vram.append(vram)
-        self._epoch_util.append(util)
 
         return result["loss"]
         
@@ -334,9 +331,8 @@ class R2GenGPT(pl.LightningModule):
         if self._train_epoch_start_time is not None:
             train_epoch_time_sec = time.time() - self._train_epoch_start_time
             train_epoch_time_hr = train_epoch_time_sec / 3600.0  # konversi ke jam
-            train_epoch_time_hr = round(train_epoch_time_hr, 2) # pembulatan 2 desimal
+            self.log("train_epoch_time", train_epoch_time_hr, on_step=False, on_epoch=True, rank_zero_only=True)
 
-            self.log("train_epoch_time", float(train_epoch_time_hr), on_step=False, on_epoch=True, rank_zero_only=True)
         self._log_gpu_cpu_epoch("train")
 
     def save_checkpoint(self, eval_res):
@@ -410,11 +406,9 @@ class R2GenGPT(pl.LightningModule):
         device_idx = torch.cuda.current_device()
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
 
-        vram = torch.cuda.memory_allocated() / (1024 ** 3)
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
+        vram = pynvml.nvmlDeviceGetMemoryInfo(handle).used / (1024**3)
 
         self._epoch_vram.append(vram)
-        self._epoch_util.append(util)
 
         return hypo, ref
     
@@ -443,8 +437,9 @@ class R2GenGPT(pl.LightningModule):
         for k, v in eval_res.items():
             eval_res[k] = self.trainer.strategy.reduce(v, reduce_op="mean")
             
+        # Log semua metrik evaluasi
         self.log_dict(eval_res, sync_dist=False, logger=True)
-
+        
         result_folder = os.path.join(self.hparams.savedmodel_path, 'result')
         os.makedirs(result_folder, exist_ok=True)
         current_epoch, global_step = self.trainer.current_epoch, self.trainer.global_step
@@ -470,9 +465,7 @@ class R2GenGPT(pl.LightningModule):
         if self._val_epoch_start_time is not None:
             val_epoch_time_sec = time.time() - self._val_epoch_start_time
             val_epoch_time_hr = val_epoch_time_sec / 3600.0
-            val_epoch_time_hr = round(val_epoch_time_hr, 2)  # contoh: 0.50, 0.83, 1.75
-
-            self.log("val_epoch_time", float(val_epoch_time_hr), on_step=False, on_epoch=True, rank_zero_only=True)
+            self.log("val_epoch_time", val_epoch_time_hr, on_step=False, on_epoch=True, rank_zero_only=True)
 
         # log vram/util per-epoch
         self._log_gpu_cpu_epoch("val")
@@ -519,17 +512,18 @@ class R2GenGPT(pl.LightningModule):
         end = time.time()
         latency = end - start
 
-        # ===== GPU UTIL + VRAM =====
+        # ===== VRAM (REAL) =====
         device_idx = torch.cuda.current_device()
         handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
-
-        util = pynvml.nvmlDeviceGetUtilizationRates(handle).gpu
         vram = pynvml.nvmlDeviceGetMemoryInfo(handle).used / 1024**3
+
+        # ===== CPU RAM =====
+        cpu_ram = psutil.virtual_memory().used / 1024**3
 
         # ===== Simpan untuk perhitungan final =====
         self.test_latencies.append(latency)
-        self.test_utils.append(util)
         self.test_vrams.append(vram)
+        self.test_cpu_rams.append(cpu_ram)
         
         hypo = [self.decode(i) for i in outputs]
         ref = [self.decode(i) for i in to_regress_tokens['input_ids']]
@@ -557,51 +551,35 @@ class R2GenGPT(pl.LightningModule):
         json.dump(hypo, open(os.path.join(result_folder, f"test_result.json"), 'w'))
         json.dump(ref, open(os.path.join(result_folder, 'test_refs.json'), 'w'))
         self.print(f"Test result of {self.hparams.delta_file}: {eval_res}")
+        
         # ======== PERFORMANCE LOGGING =========
         avg_lat = float(np.mean(self.test_latencies)) if self.test_latencies else 0.0
         std_lat = float(np.std(self.test_latencies)) if self.test_latencies else 0.0
         throughput = 1.0 / avg_lat if avg_lat > 0 else 0.0
 
-        avg_util = float(np.mean(self.test_utils)) if self.test_utils else 0.0
-        peak_util = float(np.max(self.test_utils)) if self.test_utils else 0.0
+        # VRAM & CPU RAM → gunakan PEAK
+        peak_vram = float(max(self.test_vrams)) if self.test_vrams else 0.0
+        peak_cpu_ram = float(max(self.test_cpu_rams)) if self.test_cpu_rams else 0.0
 
-        avg_vram = float(np.mean(self.test_vrams)) if self.test_vrams else 0.0
-        peak_vram = float(np.max(self.test_vrams)) if self.test_vrams else 0.0
-
-        # ==== PEMBULATAN FORMAT ====
-        # waktu dalam detik, 3 desimal
-        avg_lat = round(avg_lat, 3)
-        std_lat = round(std_lat, 3)
-
-        # throughput (batch/s), 5 desimal
-        throughput = round(throughput, 5)
-
-        # util dalam persen, 1 desimal
-        avg_util = round(avg_util, 1)
-        peak_util = round(peak_util, 1)
-
-        # VRAM dalam GB, 2 desimal
-        avg_vram = round(avg_vram, 2)
-        peak_vram = round(peak_vram, 2)
+        # ==== FORMAT ====
+        avg_lat = avg_lat
+        std_lat = std_lat
+        throughput = throughput
+        peak_vram = peak_vram
+        peak_cpu_ram = peak_cpu_ram
 
         # Simpan ke CSV
-        header = [
-            "avg_latency", "std_latency", "throughput",
-            "avg_util", "peak_util", "avg_vram", "peak_vram"
-        ]
-        data = [avg_lat, std_lat, throughput,
-                avg_util, peak_util, avg_vram, peak_vram]
+        header = ["avg_latency", "std_latency", "throughput", "gpu_vram", "cpu_ram"]
+        data = [avg_lat, std_lat, throughput, peak_vram, peak_cpu_ram]
 
         csv_path = os.path.join(self.hparams.savedmodel_path, "test_perf_metrics.csv")
-
-        # pakai "w" biar selalu overwrite per run
         with open(csv_path, mode="w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
             writer.writerow(data)
 
         print(f"Saved test performance metrics to {csv_path}")
-
+    
     def configure_optimizers(self):
 
         # ------------------------------
