@@ -1,4 +1,4 @@
-from pytorch_lightning import LightningDataModule
+from lightning.pytorch import LightningDataModule
 from torch.utils.data import DataLoader
 from dataset.data_helper import create_datasets
 

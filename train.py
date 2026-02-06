@@ -4,8 +4,8 @@ from configs.config import parser
 from dataset.data_module import DataModule
 from lightning_tools.callbacks import add_callbacks
 from models.R2GenGPT import R2GenGPT
-from pytorch_lightning import seed_everything
-import pytorch_lightning as pl
+from lightning.pytorch import seed_everything
+import lightning.pytorch as pl
 import warnings, logging
 import transformers
 
@@ -16,7 +16,7 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 # 🔇 Matikan semua log Hugging Face (transformers)
 transformers.utils.logging.set_verbosity_error()
 
-logging.getLogger("pytorch_lightning").setLevel(logging.ERROR)
+logging.getLogger("lightning.pytorch").setLevel(logging.ERROR)
 logging.getLogger("transformers").setLevel(logging.ERROR)
 logging.getLogger("absl").setLevel(logging.ERROR)
 

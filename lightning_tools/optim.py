@@ -1,4 +1,3 @@
-from torch.optim import AdamW
 import functools
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -47,17 +46,13 @@ def config_optimizer(parameters, init_lr, warmup_steps, max_steps, name='lr'):
     Returns:
 
     """
-    # agar warmup tidak melebihi total steps.
-    warmup_steps = min(warmup_steps, max_steps - 1)
-    
-    optimizer = AdamW(
-        parameters, lr=init_lr, eps=1e-8, weight_decay=0.01
+    optimizer = torch.optim.AdamW(
+        parameters, lr=init_lr, eps=1e-8, correct_bias=False
     )
 
     scheduler = get_linear_schedule_with_warmup(
         optimizer, num_warmup_steps=warmup_steps, num_training_steps=max_steps,
     )
-    
     scheduler = {'scheduler': scheduler, 'name': name, 'interval': 'step', 'frequency': 1}
 
     return optimizer, scheduler

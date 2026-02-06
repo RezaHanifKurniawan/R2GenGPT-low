@@ -4,7 +4,7 @@ parser = argparse.ArgumentParser(description="hyper-parameter for R2GenGPT")
 # ========================= Dataset Configs ==========================
 parser.add_argument('--test', action='store_true', help="only run test set")
 parser.add_argument('--validate', action='store_true', help="only run validation set")
-parser.add_argument('--dataset', type=str, default='mimic_cxr', help="iu-xray or mimic-cxr")
+parser.add_argument('--dataset', type=str, default='iu-xray', help="iu-xray or mimic-cxr")
 parser.add_argument('--annotation', type=str, default=r'./data/mimic_cxr/annotation.json', help="annotation file of the dataset")
 parser.add_argument('--base_dir', type=str, default=r'./data/mimic_cxr/images', help="base dir to help find images")
 parser.add_argument('--batch_size', default=6, type=int, help="use for training duration per worker")
@@ -17,15 +17,12 @@ parser.add_argument('--num_workers', default=8, type=int, help="Cpu num for data
 parser.add_argument('--vision_model', default='microsoft/swin-base-patch4-window7-224', type=str, help="vision model to use")
 parser.add_argument('--llama_model', default='meta-llama/Llama-2-7b-chat-hf', type=str, help="LLM model to use")
 parser.add_argument('--freeze_vm', default=True, type=lambda x: (str(x).lower() == 'true'), help='freeze vision model')
-parser.add_argument('--llm_r', default=16, type=int, help='The dimension used by the LoRA update matrices')
-parser.add_argument('--llm_alpha', default=16, type=int, help='Scaling factor.')
 parser.add_argument('--vis_use_lora', default=False, type=lambda x: (str(x).lower() == 'true'), help="whether use lora for vision model")
 parser.add_argument('--vis_r', default=16, type=int, help='The dimension used by the LoRA update matrices')
 parser.add_argument('--vis_alpha', default=16, type=int, help='Scaling factor.')
-parser.add_argument('--llm_lora_dropout', default=0.1, type=float, help='lora dropout')
 parser.add_argument('--vis_lora_dropout', default=0.1, type=float, help='lora dropout')
 parser.add_argument('--global_only', default=False, type=lambda x: (str(x).lower() == 'true'), help='use global embedding only')
-parser.add_argument('--low_resource', default=False, type=bool, help='use low resource mode (qlora)')
+parser.add_argument('--low_resource', default=False, type=bool, help='use low resource mode')
 parser.add_argument('--end_sym', default='</s>', type=str)
 
 # ======================== SavedModel Configs ===========================
@@ -36,7 +33,7 @@ parser.add_argument('--weights', type=list, default=[0.5, 0.5])
 parser.add_argument('--scorer_types', type=list, default=['Bleu_4', 'CIDEr'])
 
 # ========================= Learning Configs ==========================
-parser.add_argument('--learning_rate', default=1e-4, type=float, help='initial learning rate')
+parser.add_argument('--learning_rate', default=1e-4, type=float, help='initial learning rate for vision encoder and mapper')
 parser.add_argument('--gradient_clip_val', default=None, type=float, help='gradient clip value')
 
 # ========================= Decoding Settings ==========================
